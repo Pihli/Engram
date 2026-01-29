@@ -26,6 +26,8 @@ pip install torch numpy transformers sympy
 from typing import List
 from dataclasses import dataclass, field
 import math
+import torch_npu
+import pandas as pd
 
 ## third-party
 from sympy import isprime
@@ -33,11 +35,196 @@ import numpy as np
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
-from tokenizers import normalizers, Regex 
+from tokenizers import normalizers, Regex
+
+import time
+import json
+from functools import wraps
+from typing import Dict, List, Any, Optional
+from contextlib import contextmanager
+import tqdm
+
+class TracingAnalyzer:
+    """支持 Chrome Tracing 格式的性能分析器"""
+    
+    def __init__(self, output_file: str = "trace.json"):
+        """
+        Args:
+            output_file: 输出的 trace 文件路径
+        """
+        self.output_file = output_file
+        self.events: List[Dict[str, Any]] = []
+        self.process_id = 1
+        self.thread_counter = {}
+        
+    def _get_thread_id(self, thread_name: str) -> int:
+        """获取或创建线程ID"""
+        if thread_name not in self.thread_counter:
+            self.thread_counter[thread_name] = len(self.thread_counter) + 1
+        return self.thread_counter[thread_name]
+    
+    def _create_event(self, name: str, ph: str, ts: float, 
+                     tid: int, dur: Optional[float] = None, 
+                     args: Optional[Dict] = None) -> Dict[str, Any]:
+        """创建 Chrome Tracing 事件"""
+        event = {
+            "name": name,
+            "cat": "function",
+            "ph": ph,  # B: begin, E: end, X: complete
+            "ts": ts * 1_000_000,  # 转换为微秒
+            "pid": self.process_id,
+            "tid": tid,
+            "args": args or {}
+        }
+        if dur is not None:
+            event["dur"] = dur * 1_000_000  # 转换为微秒
+        return event
+    
+    def trace_function(self, name_or_func, custom_name: str=None):
+        if isinstance(name_or_func, str):
+            def decorator_with_name(func):
+                return self.trace_function(func, custom_name=name_or_func)
+            return decorator_with_name
+        
+        # 如果直接装饰函数（无括号调用）
+        if name_or_func is None:
+            # 如果无参数调用，返回一个接受函数的装饰器
+            def decorator(func):
+                return self.trace_function(func)
+            return decorator
+        func = name_or_func
+        """追踪函数的装饰器"""
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            thread_id = self._get_thread_id("main")
+            
+            # 开始事件
+            start_time = time.time()
+            start_event = self._create_event(
+                name=custom_name or f"{func.__module__}.{func.__name__}",
+                ph="B",
+                ts=start_time,
+                tid=thread_id
+            )
+            self.events.append(start_event)
+            
+            try:
+                result = func(*args, **kwargs)
+                return result
+            finally:
+                # 结束事件
+                end_time = time.time()
+                end_event = self._create_event(
+                    name=f"{func.__module__}.{func.__name__}",
+                    ph="E",
+                    ts=end_time,
+                    tid=thread_id
+                )
+                self.events.append(end_event)
+        return wrapper
+    
+    @contextmanager
+    def trace_block(self, name: str, category: str = "block"):
+        """追踪代码块的上下文管理器"""
+        thread_id = self._get_thread_id("main")
+        
+        # 开始事件
+        start_time = time.time()
+        start_event = self._create_event(
+            name=name,
+            ph="B",
+            ts=start_time,
+            tid=thread_id,
+            args={"category": category}
+        )
+        self.events.append(start_event)
+        
+        try:
+            yield
+        finally:
+            # 结束事件
+            end_time = time.time()
+            end_event = self._create_event(
+                name=name,
+                ph="E",
+                ts=end_time,
+                tid=thread_id
+            )
+            self.events.append(end_event)
+    
+    def save_trace(self):
+        """保存 trace 到文件"""
+        trace_data = {
+            "traceEvents": self.events,
+            "displayTimeUnit": "ms",
+            "systemTraceEvents": "SystemTraceEvents",
+            "otherData": {
+                "version": "Python Tracing Analyzer v1.0"
+            }
+        }
+        
+        with open(self.output_file, 'w', encoding='utf-8') as f:
+            json.dump(trace_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"Trace saved to: {self.output_file}")
+        print(f"Total events: {len(self.events)}")
+        
+    def clear_trace(self):
+        """清除所有追踪事件"""
+        self.events.clear()
+
+    def export_summary(self):
+        """导出简要统计信息"""
+        import statistics
+        
+        if not self.events:
+            return {}
+        
+        # 按名称分组计算持续时间
+        durations = {}
+        stack = []  # 用于匹配 B 和 E 事件
+        
+        for event in self.events:
+            if event["ph"] == "B":
+                stack.append((event["name"], event["ts"]))
+            elif event["ph"] == "E" and stack:
+                name, start_time = stack.pop()
+                duration = (event["ts"] - start_time)
+                
+                if name not in durations:
+                    durations[name] = []
+                durations[name].append(duration)
+        
+        summary = {}
+        for name, times in durations.items():
+            if times:
+                summary[name] = {
+                    "count": len(times),
+                    "total": sum(times),
+                    "avg": statistics.mean(times),
+                    "max": max(times),
+                    "min": min(times)
+                }
+        
+        return summary
+
+
+if __name__ == "__main__":
+    tracer = TracingAnalyzer("example_trace.json")
+
+def Singleton(cls):
+    _instance = {}
+
+    def _singleton(*args, **kargs):
+        if cls not in _instance:
+            _instance[cls] = cls(*args, **kargs)
+        return _instance[cls]
+
+    return _singleton
 
 @dataclass
 class EngramConfig:
-    tokenizer_name_or_path: str = "deepseek-ai/DeepSeek-V3"
+    tokenizer_name_or_path: str = "/workdir/npu_dev_test/models/flash_think_0901_iter7000_mtp_quant_allblock_int8/"
     engram_vocab_size: List[int] = field(default_factory=lambda: [129280*5, 129280*5])
     max_ngram_size: int = 3
     n_embed_per_ngram: int = 512
@@ -49,14 +236,15 @@ class EngramConfig:
     
 @dataclass
 class BackBoneConfig:
-    hidden_size: int = 1024
-    hc_mult: int = 4
+    hidden_size: int = 7168
+    hc_mult: int = 1
     vocab_size: int = 129280
     num_layers: int = 30
     
 engram_cfg = EngramConfig()
 backbone_config = BackBoneConfig()
 
+@Singleton
 class CompressedTokenizer:
     def __init__(
         self,
@@ -108,14 +296,17 @@ class CompressedTokenizer:
             lookup[tid] = old2new[tid]
 
         return lookup, len(new_tokens)
-    
+
+    @tracer.trace_function
     def _compress(self, input_ids):
-        arr = np.asarray(input_ids, dtype=np.int64)
-        pos_mask = arr >= 0
-        out = arr.copy()
-        valid_ids = arr[pos_mask]
-        out[pos_mask] = self.lookup_table[valid_ids]
-        return out   
+        with tracer.trace_block("index", category="computation"):
+            arr = np.asarray(input_ids, dtype=np.int64)
+            pos_mask = arr >= 0
+            out = arr.copy()
+            valid_ids = arr[pos_mask]
+        with tracer.trace_block("lookup_table", category="computation"):
+            out[pos_mask] = self.lookup_table[valid_ids]
+        return out
     
     def __call__(self, input_ids):
         return self._compress(input_ids)
@@ -127,7 +318,7 @@ class ShortConv(nn.Module):
         kernel_size: int = 4, 
         dilation: int = 1, 
         norm_eps: float = 1e-5,
-        hc_mult: int = 4,
+        hc_mult: int = 1,
         activation: bool = True,
     ):
         super().__init__()
@@ -259,6 +450,7 @@ class NgramHashMapping:
             
         return vocab_size_across_layers
 
+    @tracer.trace_function
     def _get_ngram_hashes(
         self,
         input_ids: np.ndarray,
@@ -275,34 +467,35 @@ class NgramHashMapping:
                                 mode='constant', constant_values=self.pad_id)[:, :T]
             return shifted
 
-        base_shifts = [shift_k(k) for k in range(self.max_ngram_size)]
+        with tracer.trace_block("shift_k", category="computation"):
+            base_shifts = [shift_k(k) for k in range(self.max_ngram_size)]
 
         all_hashes = []
         
-        for n in range(2, self.max_ngram_size + 1):
-            n_gram_index = n - 2
-            tokens = base_shifts[:n]
-            mix = (tokens[0] * multipliers[0])
-            for k in range(1, n):
-                mix = np.bitwise_xor(mix, tokens[k] * multipliers[k])
-            num_heads_for_this_ngram = self.n_head_per_ngram
-            head_vocab_sizes = self.vocab_size_across_layers[layer_id][n_gram_index]
-            
-            for j in range(num_heads_for_this_ngram):
-                mod = int(head_vocab_sizes[j])
-                head_hash = mix % mod
-                all_hashes.append(head_hash.astype(np.int64, copy=False))
+        with tracer.trace_block("hashs", category="computation"):
+            for n in range(2, self.max_ngram_size + 1):
+                with tracer.trace_block("hash", category="computation"):
+                    n_gram_index = n - 2
+                    tokens = base_shifts[:n]
+                    mix = (tokens[0] * multipliers[0])
+                    for k in range(1, n):
+                        mix = np.bitwise_xor(mix, tokens[k] * multipliers[k])
+                    num_heads_for_this_ngram = self.n_head_per_ngram
+                    head_vocab_sizes = self.vocab_size_across_layers[layer_id][n_gram_index]
+                    
+                    for j in range(num_heads_for_this_ngram):
+                        mod = int(head_vocab_sizes[j])
+                        head_hash = mix % mod
+                        all_hashes.append(head_hash.astype(np.int64, copy=False))
         
         return np.stack(all_hashes, axis=2)
 
-    def hash(self, input_ids):
+    @tracer.trace_function
+    def hash(self, input_ids, layer_id: int):
         input_ids = self.compressed_tokenizer(input_ids)
-        hash_ids_for_all_layers = {}
-        for layer_id in self.layer_ids:
-            hash_ids_for_all_layers[layer_id] = self._get_ngram_hashes(input_ids, layer_id=layer_id)
-        return hash_ids_for_all_layers
+        return self._get_ngram_hashes(input_ids, layer_id=layer_id)
 
-class MultiHeadEmbedding(nn.Module):
+class MultiHeadEmbedding:
     def __init__(self, list_of_N: List[int], D: int):
         super().__init__()
         self.num_heads = len(list_of_N)
@@ -312,16 +505,20 @@ class MultiHeadEmbedding(nn.Module):
         for n in list_of_N[:-1]:
             offsets.append(offsets[-1] + n)
         
-        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
+        self.offsets = torch.tensor(offsets, dtype=torch.long)
         
         total_N = sum(list_of_N)
         self.embedding = nn.Embedding(num_embeddings=total_N, embedding_dim=D)
 
+    @tracer.trace_function('MultiHeadEmbedding.forward')
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         shifted_input_ids = input_ids + self.offsets
         output = self.embedding(shifted_input_ids)
         
         return output
+    
+    def __call__(self, *args, **kwds):
+        return self.forward(*args, **kwds)
     
 class Engram(nn.Module):
     def __init__(self, layer_id):
@@ -360,8 +557,8 @@ class Engram(nn.Module):
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
-        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
-        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids, self.layer_id))
+        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2).to(hidden_states.device)
         gates = []
         for hc_idx in range(backbone_config.hc_mult):
             key = self.key_projs[hc_idx](embeddings)
@@ -374,7 +571,7 @@ class Engram(nn.Module):
             gates.append(gate)
         gates = torch.stack(gates,dim=2)
         value = gates * self.value_proj(embeddings).unsqueeze(2)
-        output = value + self.short_conv(value)
+        output = value # + self.short_conv(value)
         return output 
 
 class TransformerBlock(nn.Module):
@@ -394,30 +591,47 @@ class TransformerBlock(nn.Module):
         return hidden_states
 
 if __name__ == '__main__':
-    LLM = [
+    LLM = torch.nn.ModuleList([
         nn.Embedding(backbone_config.vocab_size,backbone_config.hidden_size),
         *[TransformerBlock(layer_id=layer_id) for layer_id in range(backbone_config.num_layers)],
         nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size)
-    ]
+    ])
 
-    text = "Only Alexander the Great could tame the horse Bucephalus."
-    tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path,trust_remote_code=True)
-    input_ids = tokenizer(text,return_tensors='pt').input_ids
+    LLM = LLM.npu()
 
-    B,L = input_ids.shape
+    # text = "Only Alexander the Great could tame the horse Bucephalus."
+    # tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path,trust_remote_code=True)
+    # input_ids = tokenizer(text,return_tensors='pt').input_ids
+    # print(input_ids.shape, input_ids, type(input_ids), input_ids.dtype)
+    ds = []
+    for i in tqdm.tqdm(range(15)):
+        input_ids = torch.randint(0, backbone_config.vocab_size, (1, 2 ** i), dtype=torch.long)
+        B,L = input_ids.shape
+        for _ in range(15):
 
-    for idx, layer in enumerate(LLM):
-        if idx == 0:
-            hidden_states = LLM[0](input_ids)
-            ## mock hyper-connection
-            hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)      
-        elif idx == len(LLM)-1:
-            ## mock hyper-connection
-            hidden_states = hidden_states[:,:,0,:] 
-            output = layer(hidden_states)
-        else:
-            hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
+            for idx, layer in enumerate(LLM):
+                if idx == 0:
+                    hidden_states = LLM[0](input_ids.npu())
+                    ## mock hyper-connection
+                    hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)      
+                elif idx == len(LLM)-1:
+                    ## mock hyper-connection
+                    hidden_states = hidden_states[:,:,0,:] 
+                    output = layer(hidden_states)
+                else:
+                    hidden_states = layer(input_ids=input_ids,hidden_states=hidden_states)
+        summary = tracer.export_summary()
+        if L in [2048]:
+            tracer.save_trace()
+        tracer.clear_trace()
+        summary = {k: v['max'] for k, v in summary.items()}
+        df = pd.DataFrame(summary, index=[L])
+        ds.append(df)
+    result_df = pd.concat(ds)
+    result_df.to_csv('engram_demo_v1_performance.csv')
 
+    # 保存 trace 文件
+    # tracer.save_trace()
     print("✅ Forward Complete!")
     print(f"{input_ids.shape=}\n{output.shape=}")
             
